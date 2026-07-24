@@ -19,7 +19,7 @@ env:
   NODE_VERSION: "20"
   PACKAGE_MANAGER: "npm"
   SOURCE_DIR: "."
-  HAS_TYPESCRIPT: "false"
+  HAS_TYPESCRIPT: "true"
 
 permissions:
   contents: read
