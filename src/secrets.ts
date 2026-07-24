@@ -1,4 +1,10 @@
-import type { LoadSecretsOptions, LoadSecretsResult, Logger } from './types.js';
+import type {
+  LoadSecretsOptions,
+  LoadSecretsResult,
+  Logger,
+  RefreshSecretsOptions,
+  RefreshSecretsResult,
+} from './types.js';
 
 /** Fallback logger when a service doesn't pass its own. Quiet by default. */
 const consoleLogger: Logger = {
@@ -103,4 +109,109 @@ export async function loadSecrets(options: LoadSecretsOptions = {}): Promise<Loa
     log.warn({ error: message }, 'Infisical secret load failed — continuing with process.env');
     return { loaded: false, injected: 0, source: 'env' };
   }
+}
+
+/**
+ * Re-fetch secrets from Infisical and overwrite process.env with fresh values.
+ *
+ * Designed for two use cases:
+ *  1. SIGHUP-driven reload — call `installSighupReload()` to wire this up.
+ *  2. Interval-driven polling — pass `intervalMs` to return a timer handle.
+ *
+ * Always calls loadSecrets with `overwrite: true` so rotated values replace
+ * stale ones in process.env (the critical difference from the initial boot call).
+ *
+ * Returns a RefreshSecretsResult with a `refreshedAt` ISO timestamp so callers
+ * can track when the last successful refresh occurred.
+ */
+export async function refreshSecrets(
+  options: RefreshSecretsOptions = {},
+): Promise<RefreshSecretsResult> {
+  const log = options.logger ?? consoleLogger;
+
+  log.debug({}, 'refreshSecrets: starting re-fetch with overwrite=true');
+
+  const result = await loadSecrets({ ...options, overwrite: true });
+  const refreshResult: RefreshSecretsResult = {
+    ...result,
+    refreshedAt: new Date().toISOString(),
+  };
+
+  if (result.loaded) {
+    log.info(
+      { injected: result.injected, refreshedAt: refreshResult.refreshedAt },
+      'refreshSecrets: secrets refreshed from Infisical',
+    );
+  } else {
+    log.warn(
+      { source: result.source, refreshedAt: refreshResult.refreshedAt },
+      'refreshSecrets: re-fetch skipped or failed — process.env unchanged',
+    );
+  }
+
+  options.onRefresh?.(refreshResult);
+  return refreshResult;
+}
+
+/**
+ * Install a SIGHUP handler that calls refreshSecrets() with the given options.
+ *
+ * Follows the systemd `ExecReload=kill -HUP $MAINPID` pattern — infra's
+ * rotation-reload.timer sends SIGHUP after re-issuing the client secret,
+ * and this handler re-auths and re-hydrates process.env without restarting.
+ *
+ * Returns an uninstall function that removes the listener when called.
+ *
+ * Usage (at service entrypoint, after initial loadSecrets):
+ *   const uninstall = installSighupReload({ logger });
+ *   // on graceful shutdown:
+ *   uninstall();
+ */
+export function installSighupReload(
+  options: RefreshSecretsOptions = {},
+): () => void {
+  const log = options.logger ?? consoleLogger;
+
+  const handler = () => {
+    log.info({}, 'SIGHUP received — refreshing secrets from Infisical');
+    refreshSecrets(options).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn({ error: msg }, 'refreshSecrets on SIGHUP failed');
+    });
+  };
+
+  process.on('SIGHUP', handler);
+  log.debug({}, 'SIGHUP reload handler installed');
+
+  return () => {
+    process.off('SIGHUP', handler);
+    log.debug({}, 'SIGHUP reload handler removed');
+  };
+}
+
+/**
+ * Start an interval-based secret refresh loop.
+ *
+ * Fires immediately on first call, then repeats every `intervalMs`.
+ * Use as a belt-and-suspenders complement to SIGHUP reload — the interval
+ * ensures stale secrets are caught even without an explicit reload signal.
+ *
+ * Keep intervalMs shorter than the Infisical rotation overlap window to
+ * guarantee every instance re-fetches before the old credential is revoked.
+ *
+ * Returns a NodeJS.Timer handle. Call clearInterval(handle) to stop.
+ */
+export function startRefreshInterval(
+  intervalMs: number,
+  options: RefreshSecretsOptions = {},
+): ReturnType<typeof setInterval> {
+  const log = options.logger ?? consoleLogger;
+  log.info({ intervalMs }, 'Starting Infisical secret refresh interval');
+
+  // Fire immediately, then on interval
+  void refreshSecrets(options);
+
+  return setInterval(() => {
+    void refreshSecrets(options);
+  }, intervalMs);
 }
