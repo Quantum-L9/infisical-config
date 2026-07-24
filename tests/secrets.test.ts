@@ -6,10 +6,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 const { ctorMock, loginMock, listSecretsMock } = vi.hoisted(() => {
   const loginMock = vi.fn();
   const listSecretsMock = vi.fn();
-  const ctorMock = vi.fn(() => ({
-    auth: () => ({ universalAuth: { login: loginMock } }),
-    secrets: () => ({ listSecrets: listSecretsMock }),
-  }));
+  // Must be a real `function`, not an arrow: the SDK is invoked with `new
+  // InfisicalSDK(...)`, and arrow functions aren't constructable. Vitest 3
+  // silently tolerated this; vitest 4 enforces real constructor semantics.
+  const ctorMock = vi.fn(function InfisicalSDKMock() {
+    return {
+      auth: () => ({ universalAuth: { login: loginMock } }),
+      secrets: () => ({ listSecrets: listSecretsMock }),
+    };
+  });
   return { ctorMock, loginMock, listSecretsMock };
 });
 
