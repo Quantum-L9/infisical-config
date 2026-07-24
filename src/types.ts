@@ -39,3 +39,13 @@ export interface LoadSecretsResult {
   /** Where the effective config ultimately comes from. */
   source: 'infisical' | 'env';
 }
+
+export interface RefreshSecretsResult extends LoadSecretsResult {
+  /** ISO timestamp of when the refresh completed. */
+  refreshedAt: string;
+}
+
+export interface RefreshSecretsOptions extends LoadSecretsOptions {
+  /** Called after every successful or failed refresh attempt. */
+  onRefresh?: (result: RefreshSecretsResult) => void;
+}

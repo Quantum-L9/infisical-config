@@ -20,7 +20,7 @@ const { ctorMock, loginMock, listSecretsMock } = vi.hoisted(() => {
 
 vi.mock('@infisical/sdk', () => ({ InfisicalSDK: ctorMock }));
 
-import { loadSecrets } from '../src/index.js';
+import { loadSecrets, refreshSecrets, installSighupReload, startRefreshInterval } from '../src/index.js';
 
 const logger = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
 
@@ -35,6 +35,7 @@ const TOUCHED = [
   'INFISICAL_SITE_URL',
   'FETCHED_SECRET',
   'ALREADY_SET',
+  'ROTATED_KEY',
 ];
 
 beforeEach(() => {
@@ -45,13 +46,18 @@ beforeEach(() => {
   logger.info.mockReset();
   logger.warn.mockReset();
   logger.debug.mockReset();
+  vi.useFakeTimers();
 });
 
 afterEach(() => {
   for (const k of TOUCHED) delete process.env[k];
+  vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 const creds = { clientId: 'cid', clientSecret: 'csecret', projectId: 'proj' };
+
+// ── Original 9 loadSecrets tests (no regressions) ───────────────────────────
 
 describe('loadSecrets', () => {
   it('is a no-op when Infisical is not configured', async () => {
@@ -75,7 +81,7 @@ describe('loadSecrets', () => {
   it('reads options and env interchangeably (options win)', async () => {
     process.env.INFISICAL_PROJECT_ID = 'env-proj';
     listSecretsMock.mockResolvedValue({ secrets: [] });
-    await loadSecrets({ clientId: 'cid', clientSecret: 'csecret', logger }); // projectId from env
+    await loadSecrets({ clientId: 'cid', clientSecret: 'csecret', logger });
     expect(loginMock).toHaveBeenCalledWith({ clientId: 'cid', clientSecret: 'csecret' });
     expect(listSecretsMock).toHaveBeenCalledWith(
       expect.objectContaining({ projectId: 'env-proj', environment: 'prod', secretPath: '/' }),
@@ -123,5 +129,134 @@ describe('loadSecrets', () => {
   it('aborts on fetch error when required', async () => {
     listSecretsMock.mockRejectedValue(new Error('network down'));
     await expect(loadSecrets({ ...creds, required: true, logger })).rejects.toThrow(/network down/);
+  });
+});
+
+// ── refreshSecrets tests ─────────────────────────────────────────────────────
+
+describe('refreshSecrets', () => {
+  it('always overwrites process.env — picks up rotated value', async () => {
+    process.env.ROTATED_KEY = 'old-value';
+    listSecretsMock.mockResolvedValue({
+      secrets: [{ secretKey: 'ROTATED_KEY', secretValue: 'new-value' }],
+    });
+    const result = await refreshSecrets({ ...creds, logger });
+    expect(process.env.ROTATED_KEY).toBe('new-value');
+    expect(result.loaded).toBe(true);
+    expect(result.injected).toBe(1);
+  });
+
+  it('returns a refreshedAt ISO timestamp', async () => {
+    listSecretsMock.mockResolvedValue({ secrets: [] });
+    const result = await refreshSecrets({ ...creds, logger });
+    expect(result.refreshedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it('calls onRefresh callback with result', async () => {
+    listSecretsMock.mockResolvedValue({ secrets: [] });
+    const onRefresh = vi.fn();
+    await refreshSecrets({ ...creds, logger, onRefresh });
+    expect(onRefresh).toHaveBeenCalledOnce();
+    expect(onRefresh.mock.calls[0][0]).toMatchObject({ loaded: true });
+  });
+
+  it('warns and returns env source when Infisical is not configured', async () => {
+    const result = await refreshSecrets({ logger });
+    expect(result.loaded).toBe(false);
+    expect(result.source).toBe('env');
+    expect(result.refreshedAt).toBeTruthy();
+    expect(logger.warn).toHaveBeenCalled();
+  });
+
+  it('fails soft on fetch error — does not throw', async () => {
+    listSecretsMock.mockRejectedValue(new Error('timeout'));
+    const result = await refreshSecrets({ ...creds, logger });
+    expect(result.loaded).toBe(false);
+    expect(result.source).toBe('env');
+  });
+});
+
+// ── installSighupReload tests ────────────────────────────────────────────────
+
+describe('installSighupReload', () => {
+  it('re-fetches secrets with overwrite on SIGHUP', async () => {
+    process.env.ROTATED_KEY = 'stale';
+    listSecretsMock.mockResolvedValue({
+      secrets: [{ secretKey: 'ROTATED_KEY', secretValue: 'fresh' }],
+    });
+
+    // Use onRefresh as a completion signal so we don't race against the
+    // fire-and-forget promise inside the SIGHUP handler.
+    let resolve!: () => void;
+    const refreshDone = new Promise<void>(r => { resolve = r; });
+
+    const uninstall = installSighupReload({ ...creds, logger, onRefresh: () => resolve() });
+
+    process.emit('SIGHUP');
+    await refreshDone;
+
+    expect(process.env.ROTATED_KEY).toBe('fresh');
+    uninstall();
+  });
+
+  it('uninstall removes the SIGHUP listener', async () => {
+    listSecretsMock.mockResolvedValue({ secrets: [] });
+    const uninstall = installSighupReload({ ...creds, logger });
+    uninstall();
+
+    const callsBefore = loginMock.mock.calls.length;
+    process.emit('SIGHUP');
+    await Promise.resolve();
+    expect(loginMock.mock.calls.length).toBe(callsBefore);
+  });
+});
+
+// ── startRefreshInterval tests ───────────────────────────────────────────────
+
+describe('startRefreshInterval', () => {
+  it('fires immediately and on interval', async () => {
+    listSecretsMock.mockResolvedValue({ secrets: [] });
+
+    // Use onRefresh to signal each completion — the fire-and-forget promises
+    // inside startRefreshInterval cannot be awaited directly.
+    const completions: Array<() => void> = [];
+    const nextCompletion = () => new Promise<void>(r => completions.push(r));
+    const onRefresh = () => completions.shift()?.();
+
+    const firstDone = nextCompletion();
+    const handle = startRefreshInterval(15 * 60 * 1000, { ...creds, logger, onRefresh });
+
+    // Wait for the immediate first fire
+    await firstDone;
+    expect(loginMock).toHaveBeenCalledTimes(1);
+
+    // Register completion listener before advancing so we never miss the callback
+    const secondDone = nextCompletion();
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+    await secondDone;
+    expect(loginMock).toHaveBeenCalledTimes(2);
+
+    clearInterval(handle);
+  });
+
+  it('does not call Infisical after clearInterval', async () => {
+    listSecretsMock.mockResolvedValue({ secrets: [] });
+
+    let resolveFirst!: () => void;
+    const firstFire = new Promise<void>(r => { resolveFirst = r; });
+
+    // Wait for the immediate fire before clearing, so it doesn't bleed into
+    // the post-clearInterval assertion.
+    const handle = startRefreshInterval(15 * 60 * 1000, {
+      ...creds,
+      logger,
+      onRefresh: () => resolveFirst(),
+    });
+    await firstFire;
+    clearInterval(handle);
+
+    const callsAfterClear = loginMock.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+    expect(loginMock.mock.calls.length).toBe(callsAfterClear);
   });
 });
